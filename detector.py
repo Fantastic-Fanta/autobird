@@ -112,12 +112,16 @@ class Detector:
         gray = self._to_gray(frame)
         tmpl_gray = self._to_gray(self._bird_tmpl)
 
-        fh, fw = gray.shape[:2]
+        # Exclude the bottom HUD strip to avoid false matches on score/logo.
+        search_h = int(gray.shape[0] * config.BIRD_SEARCH_VMAX)
+        search_gray = gray[:search_h]
+
+        fh, fw = search_gray.shape[:2]
         th, tw = tmpl_gray.shape[:2]
         if th > fh or tw > fw:
-            return None  # template larger than frame — skip silently
+            return None
 
-        result = cv2.matchTemplate(gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+        result = cv2.matchTemplate(search_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
         if config.DEBUG:

@@ -17,11 +17,15 @@ BIRD_SPRITE_FRAMES = 4
 
 # Template-matching confidence thresholds (0.0–1.0).
 # Lower = more detections but more false positives; raise if you see ghost detections.
-BIRD_THRESHOLD = 0.60
+BIRD_THRESHOLD = 0.50
 PIPE_THRESHOLD = 0.45
 
 # Minimum pixel distance on the x-axis between two pipe detections of the same type.
 # Prevents the same physical pipe column from being counted twice.
+# Fraction of frame height to exclude at the bottom when searching for the bird.
+# Prevents the HUD (score counter, TIX logo) from producing false matches.
+BIRD_SEARCH_VMAX = 0.82
+
 PIPE_SUPPRESS_DIST = 40
 
 # Maximum x-distance (px) between a top-pipe and bottom-pipe match for them to be

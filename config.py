@@ -17,14 +17,13 @@ BIRD_SPRITE_FRAMES = 4
 
 # Template-matching confidence thresholds (0.0–1.0).
 # Lower = more detections but more false positives; raise if you see ghost detections.
-BIRD_THRESHOLD = 0.50
+BIRD_THRESHOLD = 0.9   # TM_CCORR_NORMED with mask — good matches score 0.85+
 PIPE_THRESHOLD = 0.45
 
-# Minimum pixel distance on the x-axis between two pipe detections of the same type.
-# Prevents the same physical pipe column from being counted twice.
-# Fraction of frame height to exclude at the bottom when searching for the bird.
-# Prevents the HUD (score counter, TIX logo) from producing false matches.
+# Fraction of frame height/width to search when locating the bird.
+# The bird is always in the left ~40 % of the screen and above the HUD strip.
 BIRD_SEARCH_VMAX = 0.82
+BIRD_SEARCH_XMAX = 0.55   # bird sits in the left ~50 % of the screen
 
 PIPE_SUPPRESS_DIST = 40
 
@@ -35,7 +34,7 @@ PIPE_PAIR_TOLERANCE = 50
 # Scale factors applied to templates at load time.
 # Ideal value = (sprite pixels on screen) / (template image pixels).
 # Bird sprite sheet: 64x64 px per frame.
-BIRD_TEMPLATE_SCALE  = 0.5   # 64px -> ~32px; tune to match on-screen bird size
+BIRD_TEMPLATE_SCALE  = 0.5   # 64px -> 32px; matches on-screen bird size in 679x499 frame
 # Tree/pipe templates: 128x384 px sprites.
 PIPE_TEMPLATE_SCALE  = 0.5   # 128x384 -> 64x192px; tune to match on-screen pipe size
 

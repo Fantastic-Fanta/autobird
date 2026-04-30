@@ -12,11 +12,13 @@ import config
 class Detector:
     def __init__(self):
         self._sct = mss.mss()
+        self._bird_smooth = None   # EMA-smoothed (cx, cy) or None
 
-        # Load templates in colour and grayscale.
-        self._bird_tmpl   = self._load_template(
+        # Load all animation frames of the bird sprite as separate templates + masks.
+        self._bird_tmpls, self._bird_masks = self._load_bird_frames(
             config.BIRD_TEMPLATE, config.BIRD_SPRITE_FRAMES, config.BIRD_TEMPLATE_SCALE
         )
+        self._bird_tmpl = self._bird_tmpls[0]  # kept for shape reference
         self._top_tmpl    = self._load_template(
             config.PIPE_TOP_TEMPLATE,
             scale=config.PIPE_TEMPLATE_SCALE,
@@ -35,6 +37,43 @@ class Detector:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_bird_frames(path: str, sprite_frames: int, scale: float):
+        """Return (frames, masks) — one BGR array and one uint8 mask per animation frame.
+
+        Paletted PNGs render their transparent background as black when loaded
+        by OpenCV.  We detect those pixels and mask them out so template
+        matching ignores them.
+        """
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(f"Template not found: {path}")
+
+        # Build a per-pixel alpha mask.
+        if img.ndim == 3 and img.shape[2] == 4:
+            # True RGBA — use the alpha channel directly.
+            alpha = img[:, :, 3]
+            img   = img[:, :, :3]
+        else:
+            # BGR or indexed (palette already expanded to BGR by OpenCV).
+            # Background pixels are pure black; bird pixels are not.
+            img = img if img.ndim == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            alpha = (img.max(axis=2) > 15).astype(np.uint8) * 255
+
+        frame_w = img.shape[1] // sprite_frames
+        frames, masks = [], []
+        for i in range(sprite_frames):
+            f = img[:,   i * frame_w:(i + 1) * frame_w]
+            m = alpha[:, i * frame_w:(i + 1) * frame_w]
+            if scale != 1.0:
+                h, w    = f.shape[:2]
+                new_sz  = (max(1, int(w * scale)), max(1, int(h * scale)))
+                f = cv2.resize(f, new_sz, interpolation=cv2.INTER_NEAREST)
+                m = cv2.resize(m, new_sz, interpolation=cv2.INTER_NEAREST)
+            frames.append(f)
+            masks.append(m)
+        return frames, masks
 
     @staticmethod
     def _load_template(
@@ -106,34 +145,69 @@ class Detector:
         """
         Locate the bird in *frame* using template matching.
 
-        Returns (cx, cy) — the centre of the best match — or None if the
-        confidence is below BIRD_THRESHOLD.
+        Returns (cx, cy) — the EMA-smoothed centre of the best match — or
+        None if the confidence is below BIRD_THRESHOLD.
         """
+        if config.DEBUG and not hasattr(self, '_frame_size_logged'):
+            print(f"[DEBUG] frame shape={frame.shape}  bird template shape={self._bird_tmpl.shape}")
+            self._frame_size_logged = True
+
         gray = self._to_gray(frame)
-        tmpl_gray = self._to_gray(self._bird_tmpl)
 
-        # Exclude the bottom HUD strip to avoid false matches on score/logo.
+        # Restrict search to the top-left region: bird never reaches the HUD
+        # at the bottom or the right portion of the screen.
         search_h = int(gray.shape[0] * config.BIRD_SEARCH_VMAX)
-        search_gray = gray[:search_h]
+        search_w = int(gray.shape[1] * config.BIRD_SEARCH_XMAX)
+        search_gray = gray[:search_h, :search_w]
 
-        fh, fw = search_gray.shape[:2]
-        th, tw = tmpl_gray.shape[:2]
-        if th > fh or tw > fw:
-            return None
+        if config.DEBUG and not hasattr(self, '_diag_saved'):
+            cv2.imwrite('debug_template.png', self._bird_tmpls[0])
+            cv2.imwrite('debug_template_gray.png', self._to_gray(self._bird_tmpls[0]))
+            cv2.imwrite('debug_search_region.png', search_gray)
+            print("[DEBUG] saved debug_template.png, debug_template_gray.png, debug_search_region.png")
+            self._diag_saved = True
 
-        result = cv2.matchTemplate(search_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        best_val, best_loc = -1.0, None
+        for tmpl, mask in zip(self._bird_tmpls, self._bird_masks):
+            tg = self._to_gray(tmpl)
+            if tg.shape[0] > search_gray.shape[0] or tg.shape[1] > search_gray.shape[1]:
+                continue
+            result = cv2.matchTemplate(search_gray, tg, cv2.TM_CCORR_NORMED, mask=mask)
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            if max_val > best_val:
+                best_val, best_loc = max_val, max_loc
 
+        max_val, max_loc = best_val, best_loc
+
+        if config.DEBUG and not hasattr(self, '_score_print_next'):
+            self._score_print_next = 0.0
         if config.DEBUG:
-            print(f"bird match score: {max_val:.3f} (threshold={config.BIRD_THRESHOLD})")
+            import time
+            now = time.monotonic()
+            if now >= self._score_print_next:
+                print(f"bird match score: {max_val:.3f} (threshold={config.BIRD_THRESHOLD})")
+                self._score_print_next = now + 1.0
 
         if max_val < config.BIRD_THRESHOLD:
-            return None
+            # Lost the bird; decay the smoothed position rather than snapping to None.
+            return self._bird_smooth
 
         x, y = max_loc
         cx = x + self._bird_w // 2
         cy = y + self._bird_h // 2
-        return (cx, cy)
+
+        # EMA smoothing: α=0.4 keeps the marker stable while still tracking quickly.
+        alpha = 0.4
+        if self._bird_smooth is None:
+            self._bird_smooth = (cx, cy)
+        else:
+            sx, sy = self._bird_smooth
+            self._bird_smooth = (
+                int(alpha * cx + (1 - alpha) * sx),
+                int(alpha * cy + (1 - alpha) * sy),
+            )
+
+        return self._bird_smooth
 
     def find_pipes(self, frame: np.ndarray) -> list:
         """

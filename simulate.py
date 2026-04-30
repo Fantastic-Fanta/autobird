@@ -14,40 +14,74 @@ JUMP_VEL   = 9.0                  # velocity set on jump
 PIPE_SPEED = 0.008 * WIDTH        # px per frame (~5.43 px @ 679 wide)
 SPAWN_SECS = 1.5                  # seconds between pipe spawns
 
-BIRD_X = int(WIDTH * 0.333)
-PIPE_W = config.PIPE_TOP_SIZE[0]  # 115 px
-GAP_H  = 120                      # pixels of open space between pipes
+BIRD_X       = int(WIDTH * 0.333)
+PIPE_W       = config.PIPE_TOP_SIZE[0]   # 115 px
+GAP_H        = 160                       # pixels of open space between pipes
+FLAP_SECS    = 0.15                      # animation frame interval (from src_bird.txt)
 
 SKY   = (68, 149, 245)
-GREEN = (34, 139, 34)
-WHITE = (255, 255, 255)
 RED   = (220, 40, 40)
 BLACK = (0, 0, 0)
 
 
+def load_assets():
+    # Bird: 4 × 64×64 frames in a horizontal sprite sheet, scaled 0.5 → 32×32
+    sheet = pygame.image.load(config.BIRD_TEMPLATE).convert_alpha()
+    fw = sheet.get_width() // config.BIRD_SPRITE_FRAMES
+    fh = sheet.get_height()
+    s  = config.BIRD_TEMPLATE_SCALE
+    bird_frames = [
+        pygame.transform.scale(
+            sheet.subsurface((i * fw, 0, fw, fh)),
+            (int(fw * s), int(fh * s)),
+        )
+        for i in range(config.BIRD_SPRITE_FRAMES)
+    ]
+
+    # Pipes pre-scaled to (PIPE_W, HEIGHT).
+    # Top pipe blit at (x, gap_top - HEIGHT) → bottom of image sits at gap_top.
+    # Bottom pipe blit at (x, gap_bottom)    → top of image sits at gap_bottom.
+    pipe_top = pygame.transform.scale(
+        pygame.image.load(config.PIPE_TOP_TEMPLATE).convert_alpha(),
+        (PIPE_W, HEIGHT),
+    )
+    pipe_bot = pygame.transform.scale(
+        pygame.image.load(config.PIPE_BOTTOM_TEMPLATE).convert_alpha(),
+        (PIPE_W, HEIGHT),
+    )
+
+    return bird_frames, pipe_top, pipe_bot
+
+
 class Bird:
     def __init__(self):
-        self.x   = BIRD_X
-        self.y   = float(HEIGHT // 2)
-        self.vel = 0.0
+        self.x          = BIRD_X
+        self.y          = float(HEIGHT // 2)
+        self.vel        = 0.0
         self._last_jump = -999.0
+        self.frame      = 0
+        self._last_flap = 0.0
 
     def jump(self):
         now = time.perf_counter()
         if now - self._last_jump >= config.JUMP_COOLDOWN:
-            self.vel = JUMP_VEL
+            self.vel        = JUMP_VEL
             self._last_jump = now
 
     def step(self):
         self.vel += GRAVITY
         self.y   -= self.vel
         self.y    = max(0.0, min(float(HEIGHT - 1), self.y))
+        now = time.perf_counter()
+        if now - self._last_flap >= FLAP_SECS:
+            self.frame      = (self.frame + 1) % config.BIRD_SPRITE_FRAMES
+            self._last_flap = now
 
 
 class Pipe:
     def __init__(self, x, gap_y):
-        self.x      = float(x)
-        self.gap_y  = gap_y
+        self.x       = float(x)
+        self.gap_y   = gap_y
         self._scored = False
 
     def step(self):
@@ -76,20 +110,20 @@ def spawn_pipe():
     return Pipe(WIDTH, gap_y)
 
 
-def draw(screen, font, big_font, bird, pipes, score, alive):
+def draw(screen, font, big_font, bird_frames, pipe_top, pipe_bot, bird, pipes, score, alive):
     screen.fill(SKY)
 
     for p in pipes:
-        ix = int(p.x)
-        gap_top    = p.gap_y - GAP_H // 2
+        ix        = int(p.x)
+        gap_top   = p.gap_y - GAP_H // 2
         gap_bottom = p.gap_y + GAP_H // 2
-        pygame.draw.rect(screen, GREEN, pygame.Rect(ix, 0, PIPE_W, gap_top))
-        pygame.draw.rect(screen, GREEN, pygame.Rect(ix, gap_bottom, PIPE_W, HEIGHT - gap_bottom))
+        screen.blit(pipe_top, (ix, gap_top - HEIGHT))
+        screen.blit(pipe_bot, (ix, gap_bottom))
         pygame.draw.line(screen, RED, (ix, p.gap_y), (ix + PIPE_W, p.gap_y), 2)
 
-    # Bird as a horizontal line
     bx, by = bird.x, int(bird.y)
-    pygame.draw.line(screen, WHITE, (bx - 15, by), (bx + 15, by), 3)
+    img = bird_frames[bird.frame]
+    screen.blit(img, (bx - img.get_width() // 2, by - img.get_height() // 2))
 
     screen.blit(font.render(f"Score: {score}", True, BLACK), (10, 10))
 
@@ -116,7 +150,8 @@ def main():
     font     = pygame.font.SysFont(None, 32)
     big_font = pygame.font.SysFont(None, 56)
 
-    bird, pipes, score, last_spawn = reset()
+    bird_frames, pipe_top, pipe_bot = load_assets()
+    bird, pipes, score, last_spawn  = reset()
     alive = True
 
     while True:
@@ -160,7 +195,7 @@ def main():
 
             pipes = [p for p in pipes if not p.offscreen()]
 
-        draw(screen, font, big_font, bird, pipes, score, alive)
+        draw(screen, font, big_font, bird_frames, pipe_top, pipe_bot, bird, pipes, score, alive)
         clock.tick(config.TARGET_FPS)
 
 

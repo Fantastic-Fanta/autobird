@@ -2,6 +2,7 @@
 # detector.py — screen capture and OpenCV template-matching detection
 # ---------------------------------------------------------------------------
 
+import time
 import cv2
 import numpy as np
 import mss
@@ -19,20 +20,23 @@ class Detector:
             config.BIRD_TEMPLATE, config.BIRD_SPRITE_FRAMES, config.BIRD_TEMPLATE_SCALE
         )
         self._bird_tmpl = self._bird_tmpls[0]  # kept for shape reference
-        self._top_tmpl    = self._load_template(
-            config.PIPE_TOP_TEMPLATE,
-            scale=config.PIPE_TEMPLATE_SCALE,
-            vcrop=config.PIPE_TOP_TRUNK_CROP,
+        tw, th = config.PIPE_TOP_SIZE
+        bw, bh = config.PIPE_BOTTOM_SIZE
+        self._top_tmpl = cv2.resize(
+            self._load_template(config.PIPE_TOP_TEMPLATE, vcrop=config.PIPE_TOP_TRUNK_CROP),
+            (tw, th),
         )
-        self._bottom_tmpl = self._load_template(
-            config.PIPE_BOTTOM_TEMPLATE,
-            scale=config.PIPE_TEMPLATE_SCALE,
-            vcrop=config.PIPE_BOTTOM_TRUNK_CROP,
+        self._bottom_tmpl = cv2.resize(
+            self._load_template(config.PIPE_BOTTOM_TEMPLATE, vcrop=config.PIPE_BOTTOM_TRUNK_CROP),
+            (bw, bh),
         )
 
         self._bird_h,   self._bird_w   = self._bird_tmpl.shape[:2]
         self._top_h,    self._top_w    = self._top_tmpl.shape[:2]
         self._bottom_h, self._bottom_w = self._bottom_tmpl.shape[:2]
+
+        self._pipe_tracks: list = []
+        self._last_pipe_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -79,14 +83,12 @@ class Detector:
     def _load_template(
         path: str,
         sprite_frames: int = 1,
-        scale: float = 1.0,
         vcrop: tuple = (0.0, 1.0),
     ) -> np.ndarray:
         img = cv2.imread(path)
         if img is None:
             raise FileNotFoundError(f"Template not found: {path}")
         if sprite_frames > 1:
-            # Sprite sheet: frames are laid out horizontally — take only the first.
             frame_w = img.shape[1] // sprite_frames
             img = img[:, :frame_w]
         if vcrop != (0.0, 1.0):
@@ -94,9 +96,6 @@ class Detector:
             y0 = int(h * vcrop[0])
             y1 = int(h * vcrop[1])
             img = img[y0:y1]
-        if scale != 1.0:
-            h, w = img.shape[:2]
-            img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))))
         return img
 
     @staticmethod
@@ -119,16 +118,57 @@ class Detector:
 
     @staticmethod
     def _suppress(hits, min_dist: int):
-        """Simple greedy non-maximum suppression on the x-axis."""
+        """Greedy non-maximum suppression in 2D."""
         if not hits:
             return []
-        # Sort by confidence descending so we keep the best hit per column.
         hits = sorted(hits, key=lambda h: -h[2])
         kept = []
         for h in hits:
-            if all(abs(h[0] - k[0]) >= min_dist for k in kept):
+            if all((h[0]-k[0])**2 + (h[1]-k[1])**2 >= min_dist**2 for k in kept):
                 kept.append(h)
         return kept
+
+    def _update_tracks(self, detections: list, now: float) -> None:
+        MATCH_TOL = config.PIPE_TOP_SIZE[0]  # 115 px — 1 pipe-width tolerance
+
+        # 1. Dead-reckon: advance every track's x left by elapsed distance.
+        dt = (now - self._last_pipe_time) if self._last_pipe_time > 0 else 0.0
+        for t in self._pipe_tracks:
+            t["x"] -= int(dt * config.PIPE_SPEED_PX_PER_SEC)
+
+        # 2. Match each detection to its nearest track.
+        unmatched = list(range(len(detections)))
+        for t in self._pipe_tracks:
+            best_dist, best_di = MATCH_TOL + 1, -1
+            for di in unmatched:
+                dist = abs(detections[di]["x"] - t["x"])
+                if dist < best_dist:
+                    best_dist, best_di = dist, di
+            if best_di != -1:
+                d = detections[best_di]
+                t["x"]         = d["x"]
+                t["gap_y"]     = d["gap_y"]
+                t["top_y"]     = d["top_rect"][1]
+                t["bot_y"]     = d["bot_rect"][1]
+                t["last_seen"] = now
+                unmatched.remove(best_di)
+
+        # 3. Spawn new tracks for unmatched detections.
+        for di in unmatched:
+            d = detections[di]
+            self._pipe_tracks.append({
+                "x": d["x"], "gap_y": d["gap_y"],
+                "top_y": d["top_rect"][1], "bot_y": d["bot_rect"][1],
+                "last_seen": now,
+            })
+
+        # 4. Expire stale tracks.
+        self._pipe_tracks = [
+            t for t in self._pipe_tracks
+            if (now - t["last_seen"]) <= config.PIPE_TRACK_MAX_AGE
+        ]
+
+        self._last_pipe_time = now
 
     # ------------------------------------------------------------------
     # Public API
@@ -154,11 +194,12 @@ class Detector:
 
         gray = self._to_gray(frame)
 
-        # Restrict search to the top-left region: bird never reaches the HUD
-        # at the bottom or the right portion of the screen.
-        search_h = int(gray.shape[0] * config.BIRD_SEARCH_VMAX)
-        search_w = int(gray.shape[1] * config.BIRD_SEARCH_XMAX)
-        search_gray = gray[:search_h, :search_w]
+        # Restrict search to the column where the bird lives.
+        # The bird's x position is fixed; pipes scroll in from the right.
+        search_h  = int(gray.shape[0] * config.BIRD_SEARCH_VMAX)
+        search_x0 = int(gray.shape[1] * config.BIRD_SEARCH_XMIN)
+        search_x1 = int(gray.shape[1] * config.BIRD_SEARCH_XMAX)
+        search_gray = gray[:search_h, search_x0:search_x1]
 
         if config.DEBUG and not hasattr(self, '_diag_saved'):
             cv2.imwrite('debug_template.png', self._bird_tmpls[0])
@@ -182,19 +223,34 @@ class Detector:
         if config.DEBUG and not hasattr(self, '_score_print_next'):
             self._score_print_next = 0.0
         if config.DEBUG:
-            import time
             now = time.monotonic()
             if now >= self._score_print_next:
                 print(f"bird match score: {max_val:.3f} (threshold={config.BIRD_THRESHOLD})")
                 self._score_print_next = now + 1.0
 
         if max_val < config.BIRD_THRESHOLD:
-            # Lost the bird; decay the smoothed position rather than snapping to None.
             return self._bird_smooth
 
         x, y = max_loc
-        cx = x + self._bird_w // 2
+        cx = search_x0 + x + self._bird_w // 2
         cy = y + self._bird_h // 2
+
+        # Colour guard: the bird is cream/tan; pipes are green.
+        # Sample the matched region in BGR and reject if green-dominant.
+        half = self._bird_w // 2
+        rx0, rx1 = max(0, cx - half), min(frame.shape[1], cx + half)
+        ry0, ry1 = max(0, cy - half), min(frame.shape[0], cy + half)
+        region = frame[ry0:ry1, rx0:rx1].astype(float)
+        if region.size > 0:
+            mean_b, mean_g, mean_r = region[:,:,0].mean(), region[:,:,1].mean(), region[:,:,2].mean()
+            if config.DEBUG:
+                now = time.monotonic()
+                if now >= getattr(self, '_color_print_next', 0.0):
+                    print(f"  colour check BGR=({mean_b:.0f},{mean_g:.0f},{mean_r:.0f})")
+                    self._color_print_next = now + 1.0
+            if mean_g > mean_r + 25:
+                # Green-dominant → pipe, not bird; hold last known position.
+                return self._bird_smooth
 
         # EMA smoothing: α=0.4 keeps the marker stable while still tracking quickly.
         alpha = 0.4
@@ -225,15 +281,52 @@ class Detector:
         top_gray    = self._to_gray(self._top_tmpl)
         bottom_gray = self._to_gray(self._bottom_tmpl)
 
+        # Restrict search to the right of the bird so pipe detection and bird
+        # detection operate on non-overlapping regions.
+        fh, fw = gray.shape[:2]
+        pipe_x0 = int(fw * config.PIPE_DETECT_XMIN)
+        search_gray = gray[:, pipe_x0:]
+
         # Find all candidate matches for each pipe type.
-        top_hits    = self._suppress(
-            self._match(gray, top_gray,    config.PIPE_THRESHOLD),
-            config.PIPE_SUPPRESS_DIST,
-        )
-        bottom_hits = self._suppress(
-            self._match(gray, bottom_gray, config.PIPE_THRESHOLD),
-            config.PIPE_SUPPRESS_DIST,
-        )
+        top_raw    = self._match(search_gray, top_gray,    config.PIPE_THRESHOLD)
+        bottom_raw = self._match(search_gray, bottom_gray, config.PIPE_THRESHOLD)
+
+        if config.DEBUG:
+            now = time.monotonic()
+            if now >= getattr(self, '_pipe_print_next', 0.0):
+                fh, fw = gray.shape[:2]
+                th, tw = top_gray.shape[:2]
+                bh, bw = bottom_gray.shape[:2]
+                r_top = cv2.matchTemplate(gray, top_gray, cv2.TM_CCOEFF_NORMED)
+                r_bot = cv2.matchTemplate(gray, bottom_gray, cv2.TM_CCOEFF_NORMED)
+                _, top_best, _, top_loc = cv2.minMaxLoc(r_top)
+                _, bot_best, _, bot_loc = cv2.minMaxLoc(r_bot)
+                print(
+                    f"pipe scores: top_best={top_best:.3f}@{top_loc}  bot_best={bot_best:.3f}@{bot_loc}"
+                    f"  (threshold={config.PIPE_THRESHOLD})"
+                    f"  top_tmpl={tw}x{th}  bot_tmpl={bw}x{bh}"
+                    f"  frame={fw}x{fh}"
+                )
+                print(f"  top_hits={len(top_raw)}  bottom_hits={len(bottom_raw)}")
+                self._pipe_print_next = now + 1.0
+
+            if not getattr(self, '_pipe_diag_saved', False):
+                r_top = cv2.matchTemplate(gray, top_gray, cv2.TM_CCOEFF_NORMED)
+                r_bot = cv2.matchTemplate(gray, bottom_gray, cv2.TM_CCOEFF_NORMED)
+                # Normalise heat maps to 0-255 for saving
+                def _norm(m):
+                    mn, mx = m.min(), m.max()
+                    return ((m - mn) / max(mx - mn, 1e-6) * 255).astype(np.uint8)
+                cv2.imwrite('debug_pipe_frame.png',   frame)
+                cv2.imwrite('debug_pipe_top_tmpl.png',    self._top_tmpl)
+                cv2.imwrite('debug_pipe_bot_tmpl.png',    self._bottom_tmpl)
+                cv2.imwrite('debug_pipe_top_heat.png',    cv2.applyColorMap(_norm(r_top), cv2.COLORMAP_JET))
+                cv2.imwrite('debug_pipe_bot_heat.png',    cv2.applyColorMap(_norm(r_bot), cv2.COLORMAP_JET))
+                print("[DEBUG] saved debug_pipe_*.png")
+                self._pipe_diag_saved = True
+
+        top_hits    = self._suppress(top_raw,    config.PIPE_SUPPRESS_DIST)
+        bottom_hits = self._suppress(bottom_raw, config.PIPE_SUPPRESS_DIST)
 
         # Pair top and bottom hits that share roughly the same x-column.
         pairs = []
@@ -256,21 +349,50 @@ class Detector:
             bx, by, _ = bottom_hits[best_idx]
             used_bottom.add(best_idx)
 
+            # Translate search_gray-relative coords back to full-frame.
+            fx_t = tx + pipe_x0
+            fx_b = bx + pipe_x0
+
             # Gap boundaries: bottom edge of top pipe ↔ top edge of bottom pipe.
-            top_bottom_edge    = ty + self._top_h
-            bottom_top_edge    = by
+            top_bottom_edge = ty + self._top_h
+            bottom_top_edge = by
             gap_y = (top_bottom_edge + bottom_top_edge) // 2
 
-            col_x = (tx + self._top_w // 2 + bx + self._bottom_w // 2) // 2
+            col_x = (fx_t + self._top_w // 2 + fx_b + self._bottom_w // 2) // 2
 
             pairs.append({
                 "x":        col_x,
                 "gap_y":    gap_y,
-                "top_rect":    (tx, ty, self._top_w, self._top_h),
-                "bot_rect":    (bx, by, self._bottom_w, self._bottom_h),
+                "top_rect": (fx_t, ty, self._top_w, self._top_h),
+                "bot_rect": (fx_b, by, self._bottom_w, self._bottom_h),
             })
 
+        self._update_tracks(pairs, time.monotonic())
         return pairs
+
+    def blot_pipes(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Return a copy of *frame* with all tracked pipe areas painted sky-blue so
+        that bird detection cannot lock on to them.
+        """
+        MARGIN = 10
+        out   = frame.copy()
+        fh, fw = out.shape[:2]
+        color = config.PIPE_BLOT_COLOR
+        half  = self._top_w // 2  # both pipes are 115 px wide
+
+        for t in self._pipe_tracks:
+            x  = t["x"]
+            x0 = max(0, x - half - MARGIN)
+            x1 = min(fw, x + half + MARGIN)
+            if x1 <= x0:
+                continue
+            # Top pipe: ceiling down to bottom edge of template.
+            out[0 : min(fh, t["top_y"] + self._top_h), x0:x1] = color
+            # Bottom pipe: top edge of template down to floor.
+            out[max(0, t["bot_y"]) : fh, x0:x1] = color
+
+        return out
 
     def next_pipe(self, pipes: list, bird_x: int):
         """
@@ -302,6 +424,15 @@ class Detector:
             bx, by, bw, bh = p["bot_rect"]
             cv2.rectangle(out, (tx, ty), (tx + tw, ty + th), (180, 80, 0), 1)
             cv2.rectangle(out, (bx, by), (bx + bw, by + bh), (180, 80, 0), 1)
+
+        # Tracked pipe predicted positions (magenta) — shows dead-reckoned state.
+        half_tw = self._top_w // 2
+        for t in self._pipe_tracks:
+            x = t["x"]
+            cv2.rectangle(out, (x - half_tw, t["top_y"]),
+                          (x + half_tw, t["top_y"] + self._top_h), (255, 0, 255), 1)
+            cv2.rectangle(out, (x - half_tw, t["bot_y"]),
+                          (x + half_tw, t["bot_y"] + self._bottom_h), (255, 0, 255), 1)
 
         # Next pipe: bright orange boxes + gap line.
         if next_p is not None:

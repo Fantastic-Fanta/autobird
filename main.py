@@ -37,8 +37,9 @@ def main():
             frame = detector.capture()
 
             # --- Detect ---
-            bird_pos = detector.find_bird(frame)
-            pipes    = detector.find_pipes(frame)
+            pipes    = detector.find_pipes(frame)   # right half only; updates tracker
+            blotted  = detector.blot_pipes(frame)   # paint tracked pipes sky-blue
+            bird_pos = detector.find_bird(blotted)  # search on cleaned frame
             next_p   = detector.next_pipe(pipes, bird_pos[0]) if bird_pos else None
 
             # --- Decide ---
